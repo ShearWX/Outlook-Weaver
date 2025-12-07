@@ -182,27 +182,26 @@
         const ctx = canvas.getContext('2d');
         const statusText = document.getElementById('status-text');
         
-        // Translucent fill for the risk areas
-        const FILL_OPACITY = 0.5; 
         const STROKE_WIDTH = 2; 
         const HANDLE_RADIUS = 6;
-        const LABEL_HANDLE_RADIUS = 4; // Smaller handle for label positioning
+        const LABEL_HANDLE_RADIUS = 4;
+        
+        // --- Off-Screen Risk Layer Setup ---
+        const riskCanvas = document.createElement('canvas');
+        const riskCtx = riskCanvas.getContext('2d');
         
         // --- State ---
         let appState = {
-            mode: 'draw', // 'draw' or 'edit'
+            mode: 'draw', 
             backgroundImage: new Image(),
-            // Shapes now include labelOffset: {x, y}
             shapes: [], 
             currentPoints: [],
             currentRisk: { type: 'SLGT', color: '#ffeb3b', priority: 2 },
-            // Added isLabelDrag to drag state
             drag: { isDragging: false, shapeIndex: -1, pointIndex: -1, isLabelDrag: false }
         };
 
         // --- Initialization ---
         window.onload = function() {
-            // Base image data is embedded here to ensure instant loading.
             const embeddedImageSrc = 'uploaded:day1otlk_0100.jpeg-04a26644-706f-4ae2-836f-33b20590ae80';
             appState.backgroundImage.src = embeddedImageSrc;
             
@@ -212,7 +211,6 @@
                 updateStatus("Base map loaded instantly. Select a risk to draw.");
             };
             
-            // Select default risk UI
             highlightRiskBtn('SLGT');
         };
 
@@ -220,9 +218,11 @@
 
         function resizeCanvasToImage() {
             if (appState.backgroundImage.complete && appState.backgroundImage.naturalWidth > 0) {
-                // Let's keep original resolution for quality, CSS handles display size
                 canvas.width = appState.backgroundImage.naturalWidth;
                 canvas.height = appState.backgroundImage.naturalHeight;
+                // Crucially, size the off-screen canvas to match the main canvas
+                riskCanvas.width = canvas.width;
+                riskCanvas.height = canvas.height;
             }
         }
 
@@ -230,7 +230,6 @@
             appState.currentRisk = { type, color, priority };
             highlightRiskBtn(type);
             updateStatus(`Drawing Risk: ${type}`);
-            
             setMode('draw'); 
         }
 
@@ -240,7 +239,6 @@
             if (mode === 'edit') {
                 canvas.classList.add('edit-mode');
                 document.getElementById('btn-edit').classList.add('active-tool');
-                // clear current drawing if any
                 appState.currentPoints = [];
                 updateStatus("Edit Mode: Drag white handles to move points or blue handles to move labels.");
             } else {
@@ -266,21 +264,20 @@
             return { x: cx, y: cy };
         }
 
-        // Creates a path for a single polygon
-        function drawPolygonPath(pts) {
+        // Creates a path for a single polygon on the given context
+        function drawPolygonPath(pts, targetCtx) {
             if (pts.length < 2) return;
-            ctx.beginPath();
-            ctx.moveTo(pts[0].x, pts[0].y);
-            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-            ctx.closePath();
+            targetCtx.beginPath();
+            targetCtx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) targetCtx.lineTo(pts[i].x, pts[i].y);
+            targetCtx.closePath();
         }
         
-        // Draws a single label for a shape
+        // Draws a single label for a shape on the main context
         function drawIndividualLabel(shape) {
             const centroid = getCentroid(shape.points);
             const type = shape.type;
             
-            // Apply offset if available
             const offsetX = shape.labelOffset ? shape.labelOffset.x : 0;
             const offsetY = shape.labelOffset ? shape.labelOffset.y : 0;
             const x = centroid.x + offsetX;
@@ -297,12 +294,36 @@
             ctx.fillStyle = "white";
             ctx.fillText(type, x, y);
         }
+        
+        // Draws an arrow head using the specified color on the given context
+        function drawArrowHead(fromX, fromY, toX, toY, color, targetCtx) { 
+            const headLength = 15;
+            const angle = Math.atan2(toY - fromY, toX - fromX);
+
+            targetCtx.beginPath();
+            targetCtx.moveTo(toX, toY);
+            targetCtx.lineTo(toX - headLength * Math.cos(angle - Math.PI / 6), toY - headLength * Math.sin(angle - Math.PI / 6));
+            targetCtx.lineTo(toX - headLength * Math.cos(angle + Math.PI / 6), toY - headLength * Math.sin(angle + Math.PI / 6));
+            targetCtx.lineTo(toX, toY);
+            targetCtx.fillStyle = color; 
+            targetCtx.fill();
+        }
+        
+        // Draws the arrow on the polygon stroke
+        function drawArrowOnPolygon(points, color, targetCtx) { 
+            if (points.length < 3) return; 
+            const last = points[points.length - 1];
+            const prev = points[points.length - 2]; 
+            drawArrowHead(prev.x, prev.y, last.x, last.y, color, targetCtx); 
+        }
+
+        // --- Main Drawing Function ---
 
         function draw(mouseX, mouseY) {
-            // 1. Clear
+            // 1. Clear Main Canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            // 2. Background
+            // 2. Draw Background on Main Canvas
             if (appState.backgroundImage.complete && appState.backgroundImage.naturalWidth > 0) {
                 ctx.drawImage(appState.backgroundImage, 0, 0);
             } else {
@@ -312,61 +333,62 @@
                 ctx.fillStyle = '#ccc';
                 ctx.fillText("Map failed to load. Please use 'Upload Map'.", canvas.width/2, canvas.height/2);
             }
-
-            // 3. Sort Shapes by Priority (Low -> High)
-            const sortedShapes = [...appState.shapes].sort((a, b) => a.priority - b.priority);
-
-            // 4. Drawing Pass 1: Fill and Cutout (Priority Low -> High)
-            sortedShapes.forEach(shape => {
-                const pts = shape.points;
-
-                // --- 4a. Masking (Cut out lower risks beneath this shape) ---
-                ctx.save(); 
-                ctx.globalCompositeOperation = 'destination-out';
-                
-                drawPolygonPath(pts); 
-                
-                // 1. Cutout the fill area
-                ctx.fillStyle = 'black';
-                ctx.fill();
-                
-                // 2. Cutout the stroke area as well. Use a slightly wider stroke (STROKE_WIDTH * 1.5) 
-                // to ensure the lower-priority shape's existing outline is sufficiently erased.
-                ctx.lineWidth = STROKE_WIDTH * 1.5; 
-                ctx.strokeStyle = 'black'; // Color doesn't matter for destination-out
-                ctx.stroke();
-                
-                ctx.restore(); 
-
-                // --- 4b. Draw the actual shape (Fill only, using lower opacity) ---
-                drawPolygonPath(pts); 
-                ctx.fillStyle = hexToRgba(shape.color, FILL_OPACITY); 
-                ctx.fill();
-            });
-
-            // 5. Drawing Pass 2: Strokes and Labels (Per-Shape Drawing - no combining)
-            const OUTLINE_COLOR = '#888888'; // Lighter, neutral grey color
             
+            // 3. --- Draw Risk Layers onto the OFF-SCREEN Canvas (riskCtx) ---
+            riskCtx.clearRect(0, 0, riskCanvas.width, riskCanvas.height);
+            const sortedShapes = [...appState.shapes].sort((a, b) => a.priority - b.priority);
+            const OUTLINE_COLOR = '#888888'; 
+
             sortedShapes.forEach(shape => {
                 const pts = shape.points;
+                
+                // 3a. Masking (Cut out lower risks beneath this shape on the risk layer)
+                riskCtx.save(); 
+                riskCtx.globalCompositeOperation = 'destination-out';
+                
+                drawPolygonPath(pts, riskCtx); 
+                
+                // Cutout the fill area
+                riskCtx.fillStyle = 'black';
+                riskCtx.fill();
+                
+                // **FIX**: Reduced the stroke width used for the cutout from STROKE_WIDTH * 1.5 to STROKE_WIDTH
+                // This makes the transition gap much smaller.
+                riskCtx.lineWidth = STROKE_WIDTH; 
+                riskCtx.strokeStyle = 'black'; 
+                riskCtx.stroke();
+                
+                riskCtx.restore(); 
 
-                // --- 5a. Draw Stroke ---
-                drawPolygonPath(pts);
-                ctx.lineWidth = STROKE_WIDTH; // Now 2px
-                ctx.strokeStyle = OUTLINE_COLOR; // Outline uses new grey color
-                ctx.stroke();
+                // 3b. Draw the actual shape (Fill and Stroke)
+                riskCtx.globalCompositeOperation = 'source-over'; 
+                
+                // Draw Fill (fully opaque)
+                drawPolygonPath(pts, riskCtx); 
+                riskCtx.fillStyle = shape.color; 
+                riskCtx.fill();
+                
+                // Draw Stroke
+                drawPolygonPath(pts, riskCtx);
+                riskCtx.lineWidth = STROKE_WIDTH; 
+                riskCtx.strokeStyle = OUTLINE_COLOR; 
+                riskCtx.stroke();
 
-                // --- 5b. Draw Arrow Head (now using OUTLINE_COLOR) ---
+                // Draw Arrow Head 
                 if (pts.length >= 3) {
-                    drawArrowOnPolygon(pts, OUTLINE_COLOR); // Arrow uses new grey color
+                    drawArrowOnPolygon(pts, OUTLINE_COLOR, riskCtx); 
                 }
-
-                // --- 5c. Draw Label (Non-consolidated) ---
-                drawIndividualLabel(shape);
             });
 
+            // 4. Composite Risk Layer onto Main Canvas
+            ctx.drawImage(riskCanvas, 0, 0);
 
-            // 6. Edit Handles (Drawn over everything, only in edit mode)
+            // 5. Drawing Pass 3: Labels and Handles (Drawn on Main Canvas)
+            
+            // 5a. Draw Labels
+            sortedShapes.forEach(drawIndividualLabel);
+
+            // 5b. Edit Handles (Only in edit mode)
             if (appState.mode === 'edit') {
                 appState.shapes.forEach((shape) => {
                     // Draw vertex handles (white circles)
@@ -385,7 +407,7 @@
                     const labelX = centroid.x + shape.labelOffset.x;
                     const labelY = centroid.y + shape.labelOffset.y;
                     
-                    ctx.fillStyle = '#3498db'; // Blue for label handle
+                    ctx.fillStyle = '#3498db'; 
                     ctx.strokeStyle = 'white';
                     ctx.lineWidth = 1;
 
@@ -405,34 +427,13 @@
                 });
             }
 
-            // 7. Render Current Drawing
+            // 6. Render Current Drawing
             if (appState.currentPoints.length > 0) {
                 drawCurrentPath(mouseX, mouseY);
             }
         }
-        
-        // Draws an arrow head using the specified color
-        function drawArrowOnPolygon(points, color) { 
-            if (points.length < 3) return; 
-            const last = points[points.length - 1];
-            const prev = points[points.length - 2]; 
-            drawArrowHead(prev.x, prev.y, last.x, last.y, color); 
-        }
 
-        // Draws an arrow head using the specified color
-        function drawArrowHead(fromX, fromY, toX, toY, color) { 
-            const headLength = 15; // length of head in pixels
-            const angle = Math.atan2(toY - fromY, toX - fromX);
-
-            ctx.beginPath();
-            ctx.moveTo(toX, toY);
-            ctx.lineTo(toX - headLength * Math.cos(angle - Math.PI / 6), toY - headLength * Math.sin(angle - Math.PI / 6));
-            ctx.lineTo(toX - headLength * Math.cos(angle + Math.PI / 6), toY - headLength * Math.sin(angle + Math.PI / 6));
-            ctx.lineTo(toX, toY);
-            ctx.fillStyle = color; 
-            ctx.fill();
-        }
-
+        // Draws the temporary path when drawing a new polygon
         function drawCurrentPath(mouseX, mouseY) {
             ctx.beginPath();
             ctx.moveTo(appState.currentPoints[0].x, appState.currentPoints[0].y);
@@ -542,7 +543,7 @@
                 appState.drag.isDragging = false;
                 appState.drag.shapeIndex = -1;
                 appState.drag.pointIndex = -1;
-                appState.drag.isLabelDrag = false; // Reset label drag flag
+                appState.drag.isLabelDrag = false; 
             }
         });
 
@@ -647,20 +648,6 @@
 
         function updateStatus(msg) {
             statusText.textContent = msg;
-        }
-
-        function hexToRgba(hex, alpha) {
-            let r = 0, g = 0, b = 0;
-            if (hex.length == 4) {
-                r = parseInt("0x" + hex[1] + hex[1]);
-                g = parseInt("0x" + hex[2] + hex[2]);
-                b = parseInt("0x" + hex[3] + hex[3]);
-            } else if (hex.length == 7) {
-                r = parseInt("0x" + hex[1] + hex[2]);
-                g = parseInt("0x" + hex[3] + hex[4]);
-                b = parseInt("0x" + hex[5] + hex[6]);
-            }
-            return `rgba(${r},${g},${b},${alpha})`;
         }
     </script>
 </body>
