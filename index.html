@@ -193,6 +193,11 @@
         const STROKE_WIDTH = 2; 
         const HANDLE_RADIUS = 6;
         const LABEL_HANDLE_RADIUS = 4;
+        const HIGHLIGHT_COLOR = '#3498db'; // Bright blue for selected points
+        
+        // NEW CONSTANTS for edge clicking tolerance
+        const EDGE_TOLERANCE = 10;
+        const EDGE_TOLERANCE_SQ = EDGE_TOLERANCE * EDGE_TOLERANCE;
         
         // Configuration for all risk levels
         const ALL_RISKS_CONFIG = [
@@ -225,7 +230,8 @@
             currentPoints: [],
             currentRisk: RISK_LOOKUP['SLGT'],
             drag: { isDragging: false, shapeIndex: -1, pointIndex: -1, isLabelDrag: false },
-            isAutoBufferEnabled: false // DEFAULT IS NOW OFF
+            isAutoBufferEnabled: false, // DEFAULT IS OFF
+            selectedShapeIndex: -1 // New state for exclusive editing
         };
 
         // --- Initialization ---
@@ -253,7 +259,6 @@
             };
             
             highlightRiskBtn('SLGT');
-            // Ensure the button state matches the initial appState (which is now OFF)
             updateAutoBufferButton(); 
         };
 
@@ -277,13 +282,17 @@
         }
 
         function setMode(mode) {
+            // Deselect any polygon when changing mode
+            if (mode !== 'edit') {
+                 deselectShape();
+            }
             appState.mode = mode;
             
             if (mode === 'edit') {
                 canvas.classList.add('edit-mode');
                 document.getElementById('btn-edit').classList.add('active-tool');
                 appState.currentPoints = [];
-                updateStatus("Edit Mode: Drag white handles to move points or blue handles to move labels.");
+                updateStatus("Edit Mode: Click a polygon to select it for editing.");
             } else {
                 canvas.classList.remove('edit-mode');
                 document.getElementById('btn-edit').classList.remove('active-tool');
@@ -313,6 +322,81 @@
         function toggleEditMode() {
             setMode(appState.mode === 'edit' ? 'draw' : 'edit');
         }
+        
+        function deselectShape() {
+            appState.selectedShapeIndex = -1;
+            appState.drag.isDragging = false;
+            appState.drag.shapeIndex = -1;
+            appState.drag.pointIndex = -1;
+            appState.drag.isLabelDrag = false; 
+            updateStatus("Edit Mode: Polygon deselected. Click a polygon to select it for editing.");
+            draw();
+        }
+
+        // --- Geometry Helpers for Edge Insertion ---
+        
+        // Squared distance between two points
+        function distSq(p1, p2) {
+            return (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y);
+        }
+
+        // Squared distance from point p to line segment (a, b)
+        // From: https://stackoverflow.com/a/6853926/894903
+        function distToSegmentSq(p, a, b) {
+            const l2 = distSq(a, b);
+            if (l2 === 0) return distSq(p, a); // a and b are the same point
+
+            // Consider the vector from a to p, and the vector from a to b.
+            // t = projection of ap onto ab, scaled by the length squared of ab
+            let t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2;
+            
+            // t must be between 0 and 1 (inclusive) to ensure the point is on the segment
+            t = Math.max(0, Math.min(1, t)); 
+            
+            const projection = {
+                x: a.x + t * (b.x - a.x),
+                y: a.y + t * (b.y - a.y)
+            };
+            
+            return distSq(p, projection);
+        }
+        
+        /**
+         * Checks if a point (x, y) is near any edge of the given shape and inserts a new point if true.
+         * @returns {number} The index of the newly inserted point, or -1 if no edge was hit.
+         */
+        function insertPointIfNearEdge(shape, x, y) {
+            const points = shape.points;
+            if (points.length < 2) return -1;
+            
+            const clickPoint = { x, y };
+            let bestSegmentIndex = -1;
+
+            // Iterate through all segments (p[i] to p[i+1] and p[last] to p[0])
+            for (let i = 0; i < points.length; i++) {
+                const p1 = points[i];
+                // Use the next point, wrapping around to the start point for the closing segment
+                const p2 = points[(i + 1) % points.length]; 
+                
+                const distSq = distToSegmentSq(clickPoint, p1, p2);
+                
+                if (distSq <= EDGE_TOLERANCE_SQ) {
+                    // Hit found! We insert the point right after p1 (index i + 1)
+                    bestSegmentIndex = i;
+                    break;
+                }
+            }
+            
+            if (bestSegmentIndex !== -1) {
+                const newIndex = bestSegmentIndex + 1;
+                // Insert the new point at the calculated location
+                points.splice(newIndex, 0, clickPoint);
+                return newIndex;
+            }
+
+            return -1;
+        }
+
 
         // --- Drawing Helpers ---
         
@@ -483,16 +567,29 @@
             // 4. Composite Risk Layer onto Main Canvas
             ctx.drawImage(riskCanvas, 0, 0);
 
-            // 5. Drawing Pass 3: Labels and Handles (Drawn on Main Canvas)
+            // 5. Background Greying for Exclusive Edit Mode
+            if (appState.mode === 'edit' && appState.selectedShapeIndex !== -1) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.2)'; // 20% transparent black overlay
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+            }
+
+
+            // 6. Drawing Pass 3: Labels and Handles (Drawn on Main Canvas)
             
-            // 5a. Draw Labels
+            // 6a. Draw Labels
             sortedShapes.forEach(drawIndividualLabel);
 
-            // 5b. Edit Handles (Only in edit mode)
+            // 6b. Edit Handles (Only in edit mode)
             if (appState.mode === 'edit') {
-                appState.shapes.forEach((shape) => {
-                    // Draw vertex handles (white circles)
-                    ctx.fillStyle = 'white';
+                const shapesToDrawHandles = appState.selectedShapeIndex !== -1 
+                    ? [appState.shapes[appState.selectedShapeIndex]]
+                    : appState.shapes; // If nothing selected, draw handles for all
+
+                shapesToDrawHandles.forEach((shape) => {
+                    const isSelected = appState.selectedShapeIndex !== -1 && shape === appState.shapes[appState.selectedShapeIndex];
+
+                    // Draw vertex handles
+                    ctx.fillStyle = isSelected ? HIGHLIGHT_COLOR : 'white'; // Blue when selected, white otherwise
                     ctx.strokeStyle = '#333';
                     ctx.lineWidth = 1;
                     shape.points.forEach(p => {
@@ -502,12 +599,12 @@
                         ctx.stroke();
                     });
 
-                    // Draw label offset handle (blue circle)
+                    // Draw label offset handle (always blue)
                     const centroid = getCentroid(shape.points);
                     const labelX = centroid.x + shape.labelOffset.x;
                     const labelY = centroid.y + shape.labelOffset.y;
                     
-                    ctx.fillStyle = '#3498db'; 
+                    ctx.fillStyle = HIGHLIGHT_COLOR; 
                     ctx.strokeStyle = 'white';
                     ctx.lineWidth = 1;
 
@@ -527,7 +624,7 @@
                 });
             }
 
-            // 6. Render Current Drawing
+            // 7. Render Current Drawing
             if (appState.currentPoints.length > 0) {
                 drawCurrentPath(mouseX, mouseY);
             }
@@ -562,39 +659,103 @@
 
         // --- Interaction Handlers ---
 
+        function isPointInHandle(p, x, y) {
+            return Math.hypot(p.x - x, p.y - y) <= HANDLE_RADIUS + 2;
+        }
+        
+        function isPointInLabelHandle(shape, x, y) {
+            const centroid = getCentroid(shape.points);
+            const labelX = centroid.x + shape.labelOffset.x;
+            const labelY = centroid.y + shape.labelOffset.y;
+            return Math.hypot(labelX - x, labelY - y) <= LABEL_HANDLE_RADIUS + 2;
+        }
+
+
         canvas.addEventListener('mousedown', (e) => {
             const { x, y } = getMousePos(e);
 
             // Edit Mode Logic
             if (appState.mode === 'edit') {
                 
-                // 1. Check for Label Handle Click (Check top shapes first)
-                for (let i = appState.shapes.length - 1; i >= 0; i--) {
-                    const shape = appState.shapes[i];
-                    const centroid = getCentroid(shape.points);
-                    const labelX = centroid.x + shape.labelOffset.x;
-                    const labelY = centroid.y + shape.labelOffset.y;
+                // 1. If a shape is ALREADY selected (Exclusive Edit Mode)
+                if (appState.selectedShapeIndex !== -1) {
+                    const selectedShape = appState.shapes[appState.selectedShapeIndex];
                     
-                    const dist = Math.hypot(labelX - x, labelY - y);
-                    if (dist <= LABEL_HANDLE_RADIUS + 2) {
+                    // Track if we started dragging anything
+                    let dragInitiated = false;
+
+                    // Check label handle of SELECTED shape
+                    if (isPointInLabelHandle(selectedShape, x, y)) {
+                        appState.drag.isDragging = true;
+                        appState.drag.isLabelDrag = true; 
+                        appState.drag.shapeIndex = appState.selectedShapeIndex;
+                        updateStatus("Editing label position...");
+                        dragInitiated = true;
+                        return;
+                    }
+                    
+                    // Check vertex handles of SELECTED shape
+                    for (let j = 0; j < selectedShape.points.length; j++) {
+                        if (isPointInHandle(selectedShape.points[j], x, y)) {
+                            appState.drag.isDragging = true;
+                            appState.drag.isLabelDrag = false; 
+                            appState.drag.shapeIndex = appState.selectedShapeIndex;
+                            appState.drag.pointIndex = j;
+                            updateStatus("Editing polygon vertex...");
+                            dragInitiated = true;
+                            return;
+                        }
+                    }
+                    
+                    // NEW LOGIC: Check for insertion on edges of the SELECTED shape
+                    const insertedIndex = insertPointIfNearEdge(selectedShape, x, y);
+                    if (insertedIndex !== -1) {
+                        // Start dragging the new point immediately
+                        appState.drag.isDragging = true;
+                        appState.drag.isLabelDrag = false;
+                        appState.drag.shapeIndex = appState.selectedShapeIndex;
+                        appState.drag.pointIndex = insertedIndex;
+                        updateStatus("New vertex created and selected for editing.");
+                        draw();
+                        dragInitiated = true;
+                        return;
+                    }
+
+
+                    // If click is NOT on any handle or edge, deselect it.
+                    if (!dragInitiated) {
+                        deselectShape();
+                    }
+                    return;
+                }
+
+                // 2. If NO shape is selected (General Edit Mode)
+                
+                // Iterate backwards (top layer first) to check for handles/selection
+                for (let i = appState.shapes.length - 1; i >= 0; i--) { 
+                    const shape = appState.shapes[i];
+                    
+                    // Check Label Handle
+                    if (isPointInLabelHandle(shape, x, y)) {
+                        appState.selectedShapeIndex = i;
                         appState.drag.isDragging = true;
                         appState.drag.isLabelDrag = true; 
                         appState.drag.shapeIndex = i;
+                        updateStatus(`Selected ${shape.type}. Editing label position...`);
+                        draw(); // Redraw for highlight
                         return;
                     }
-                }
 
-                // 2. Check if clicking a Polygon Vertex Handle
-                for (let i = appState.shapes.length - 1; i >= 0; i--) { 
-                    const shape = appState.shapes[i];
+                    // Check Polygon Vertex Handle
                     for (let j = 0; j < shape.points.length; j++) {
-                        const p = shape.points[j];
-                        const dist = Math.hypot(p.x - x, p.y - y);
-                        if (dist <= HANDLE_RADIUS + 2) {
+                        if (isPointInHandle(shape.points[j], x, y)) {
+                            appState.selectedShapeIndex = i;
                             appState.drag.isDragging = true;
                             appState.drag.isLabelDrag = false; 
                             appState.drag.shapeIndex = i;
                             appState.drag.pointIndex = j;
+                            updateStatus(`Selected ${shape.type}. Editing polygon vertex...`);
+                            draw(); // Redraw for highlight
                             return;
                         }
                     }
@@ -614,6 +775,7 @@
         canvas.addEventListener('mousemove', (e) => {
             const { x, y } = getMousePos(e);
 
+            // Only allow dragging if we are in edit mode AND a shape is actively being dragged
             if (appState.mode === 'edit' && appState.drag.isDragging) {
                 const sIdx = appState.drag.shapeIndex;
                 if (sIdx > -1) {
@@ -642,10 +804,14 @@
 
         canvas.addEventListener('mouseup', () => {
             if (appState.mode === 'edit') {
-                appState.drag.isDragging = false;
-                appState.drag.shapeIndex = -1;
-                appState.drag.pointIndex = -1;
-                appState.drag.isLabelDrag = false; 
+                // If a drag operation was in progress, release drag state
+                if (appState.drag.isDragging) {
+                    // We keep the polygon selected after a vertex move
+                    appState.drag.isDragging = false;
+                    appState.drag.pointIndex = -1;
+                    appState.drag.isLabelDrag = false; 
+                    updateStatus(`Selected ${appState.shapes[appState.selectedShapeIndex].type}. Dragging finished. Click on background to save/deselect.`);
+                }
             }
         });
 
@@ -738,14 +904,23 @@
 
         function undoLastShape() {
             if (appState.shapes.length > 0) {
-                appState.shapes.pop();
-                draw();
+                // If a shape is selected, remove it, otherwise remove the last one added.
+                if (appState.selectedShapeIndex !== -1) {
+                    appState.shapes.splice(appState.selectedShapeIndex, 1);
+                    deselectShape();
+                    updateStatus("Selected polygon removed.");
+                } else {
+                    appState.shapes.pop();
+                    draw();
+                    updateStatus("Last polygon removed.");
+                }
             }
         }
 
         function clearAll() {
             appState.shapes = [];
             appState.currentPoints = [];
+            deselectShape(); // Also clears selection
             draw();
             updateStatus("All polygons cleared.");
         }
@@ -764,7 +939,9 @@
         function downloadImage() {
             // Temporarily hide handles if in edit mode
             const prevMode = appState.mode;
+            const prevSelected = appState.selectedShapeIndex;
             appState.mode = 'preview'; // dummy mode to hide handles
+            appState.selectedShapeIndex = -1; // hide greying/handles
             draw();
             
             const link = document.createElement('a');
@@ -774,6 +951,7 @@
             
             // Restore
             appState.mode = prevMode;
+            appState.selectedShapeIndex = prevSelected;
             draw();
         }
 
