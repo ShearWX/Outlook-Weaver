@@ -215,8 +215,8 @@
             RISK_LOOKUP[r.type] = r;
         });
 
-        // Increased buffer size step (15% per priority level down)
-        const SCALE_INCREMENT = 0.15; 
+        // UPDATED: Increased buffer size step for greater spacing (was 0.15)
+        const SCALE_INCREMENT = 0.30; 
         
         // --- Off-Screen Risk Layer Setup ---
         const riskCanvas = document.createElement('canvas');
@@ -423,7 +423,7 @@
                 const vy = p.y - centroid.y;
 
                 const newVx = vx * scaleFactor;
-                const newVy = vy * scaleFactor;
+                const newVy = vy * scaleFactor; 
 
                 newPoints.push({
                     x: centroid.x + newVx,
@@ -463,6 +463,7 @@
         }
         
         // Draws an arrow head using the specified color on the given context
+        // This function draws the V-shape at (toX, toY), pointing from (fromX, fromY)
         function drawArrowHead(fromX, fromY, toX, toY, color, targetCtx) { 
             const headLength = 10; 
             const angle = Math.atan2(toY - fromY, toX - fromX);
@@ -490,12 +491,44 @@
             targetCtx.restore();
         }
         
-        // Draws the arrow on the polygon stroke
+        // Draws the arrow on a segment of the polygon stroke, centered on the first segment.
         function drawArrowOnPolygon(points, color, targetCtx) { 
             if (points.length < 3) return; 
-            const last = points[points.length - 1];
-            const prev = points[points.length - 2]; 
-            drawArrowHead(prev.x, prev.y, last.x, last.y, color, targetCtx); 
+            
+            // Use the first segment P0 -> P1 to move the arrow away from the final closing corner.
+            const p0 = points[0];
+            const p1 = points[1]; 
+            
+            // Vector from P0 to P1
+            const dx = p1.x - p0.x;
+            const dy = p1.y - p0.y;
+            const length = Math.hypot(dx, dy);
+            
+            // Arrow stem half-length (for centering the V-shape)
+            const halfStemLength = 5; 
+            
+            // Skip if the segment is too short to place the arrow centered
+            if (length < halfStemLength * 2) return; 
+
+            // Normalize vector U
+            const ux = dx / length;
+            const uy = dy / length;
+            
+            // Midpoint M (This will be the arrow tip T)
+            const mx = (p0.x + p1.x) / 2;
+            const my = (p0.y + p1.y) / 2;
+
+            // Arrow Tip (T)
+            const T_x = mx;
+            const T_y = my;
+            
+            // Arrow Feather/Stem Start (F) - move back from T along the -U vector
+            const F_x = mx - ux * halfStemLength;
+            const F_y = my - uy * halfStemLength;
+            
+            // The existing drawArrowHead function draws the V-shape at the 'to' point (T_x, T_y) 
+            // and uses (F_x, F_y) to calculate the direction.
+            drawArrowHead(F_x, F_y, T_x, T_y, color, targetCtx); 
         }
 
         // --- Main Drawing Function ---
